@@ -27,16 +27,11 @@ const CONTAINERD_BASED_RUNTIMES: &[&str] = &[
 
 /// Runtimes that don't support containerd drop-in configuration files.
 ///
-/// K3s and RKE2 generate the final config from a template (config.toml.tmpl or
-/// config-v3.toml.tmpl); they do not merge drop-in files when rendering, so we
-/// must write the Kata runtime block directly into the template.
-const RUNTIMES_WITHOUT_CONTAINERD_DROP_IN_SUPPORT: &[&str] = &[
-    "crio",
-    "k3s",
-    "k3s-agent",
-    "rke2-agent",
-    "rke2-server",
-];
+/// K3s/RKE2 are NOT listed here: although they generate the final config from a Go template,
+/// containerd itself reads the generated config.toml and follows its `imports` array.
+/// We add an `imports` line to the template (if not already present), so containerd loads
+/// our drop-in file from the default drop-in directory.
+const RUNTIMES_WITHOUT_CONTAINERD_DROP_IN_SUPPORT: &[&str] = &["crio"];
 
 fn is_containerd_based(runtime: &str) -> bool {
     CONTAINERD_BASED_RUNTIMES.contains(&runtime)

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use log::info;
 use std::env;
 use std::fs;
+use std::path::Path;
 
 use crate::k8s;
 
@@ -66,9 +67,68 @@ pub fn k3s_rke2_containerd_plugin_id(use_v3: bool) -> &'static str {
     }
 }
 
+/// K3s/RKE2: default drop-in directory name (config.toml.d or config-v3.toml.d).
+pub fn k3s_rke2_drop_in_dir_name(use_v3: bool) -> &'static str {
+    if use_v3 {
+        "config-v3.toml.d"
+    } else {
+        "config.toml.d"
+    }
+}
+
+/// Status of the drop-in imports in the generated K3s/RKE2 containerd config.
+pub enum K3sRke2ImportStatus {
+    /// Generated config already imports the default drop-in dir (k3s PR 13680). No template change needed.
+    HasDefault,
+    /// Generated config has imports, but they point to a non-default location. We cannot handle this.
+    HasNonDefault,
+    /// Generated config has no imports at all. We will prepend the import line to the template.
+    NoImports,
+}
+
+/// Check the import status of the generated K3s/RKE2 containerd config.
+/// - HasDefault:    imports already contain the default drop-in dir glob
+/// - HasNonDefault: imports exist but don't include the default drop-in dir → bail
+/// - NoImports:     no imports at all → we add ours
+pub fn k3s_rke2_check_import_status(content: &str, use_v3: bool) -> K3sRke2ImportStatus {
+    if content.contains(k3s_rke2_drop_in_dir_name(use_v3)) {
+        K3sRke2ImportStatus::HasDefault
+    } else if content.contains("imports") {
+        K3sRke2ImportStatus::HasNonDefault
+    } else {
+        K3sRke2ImportStatus::NoImports
+    }
+}
+
+/// K3s/RKE2: imports line we add to the template when the distro has no default drop-in imports.
+/// Template variable {{ .NodeConfig.Containerd.Template }} is rendered by k3s to the config dir.
+pub fn k3s_rke2_imports_value_for_template(use_v3: bool) -> &'static str {
+    if use_v3 {
+        "\"{{ .NodeConfig.Containerd.Template }}/config-v3.toml.d/*.toml\""
+    } else {
+        "\"{{ .NodeConfig.Containerd.Template }}/config.toml.d/*.toml\""
+    }
+}
+
+/// Full imports line (for prepending to template so it appears first in generated config.toml).
+pub fn k3s_rke2_imports_line_for_template(use_v3: bool) -> String {
+    format!("imports = [{}]", k3s_rke2_imports_value_for_template(use_v3))
+}
+
 /// Default Kata Containers installation directory.
 /// This is where Kata artifacts are installed by default.
 pub const DEFAULT_KATA_INSTALL_DIR: &str = "/opt/kata";
+
+/// K3s/RKE2-specific paths. Present only when runtime is k3s, k3s-agent, rke2-agent, or rke2-server.
+#[derive(Debug, Clone)]
+pub struct K3sRke2Paths {
+    /// CRI plugin ID from the generated config version (v2 vs v3). We set it here because paths.config_file is the template, not the generated config.
+    pub plugin_id: String,
+    /// True when the generated config uses containerd CRI plugin v3 (config-v3.toml).
+    pub use_v3: bool,
+    /// When we add the imports line ourselves: path to marker file. If present at cleanup, we revert the imports we added from the template.
+    pub imports_marker_file: String,
+}
 
 /// Containerd configuration paths and capabilities for a specific runtime
 #[derive(Debug, Clone)]
@@ -78,14 +138,14 @@ pub struct ContainerdPaths {
     /// Backup file path before modification
     pub backup_file: String,
     /// File to add/remove drop-in imports from (drop-in mode)
-    /// None if imports are not needed (e.g., k0s auto-loads from containerd.d/)
+    /// None if imports are not needed (e.g., k0s auto-loads from containerd.d/, or K3s/RKE2 already has default imports)
     pub imports_file: Option<String>,
     /// Path to the drop-in configuration file
     pub drop_in_file: String,
     /// Whether drop-in files can be used (based on containerd version)
     pub use_drop_in: bool,
-    /// For K3s/RKE2: CRI plugin ID to use (derived from containerd version). Others: None (read from file).
-    pub plugin_id: Option<String>,
+    /// K3s/RKE2-only: plugin ID, config version, and imports marker path. Others: None — call sites obtain plugin ID from config_file via get_containerd_pluginid when needed.
+    pub k3s_rke2: Option<K3sRke2Paths>,
 }
 
 /// Custom runtime configuration parsed from ConfigMap
@@ -504,7 +564,7 @@ impl Config {
                 imports_file: None, // k0s auto-loads from containerd.d/, imports not needed
                 drop_in_file: "/etc/containerd/containerd.d/kata-deploy.toml".to_string(),
                 use_drop_in,
-                plugin_id: None,
+                k3s_rke2: None,
             },
             "microk8s" => ContainerdPaths {
                 // microk8s uses containerd-template.toml instead of config.toml
@@ -513,12 +573,12 @@ impl Config {
                 imports_file: Some("/etc/containerd/containerd-template.toml".to_string()),
                 drop_in_file: self.containerd_drop_in_conf_file.clone(),
                 use_drop_in,
-                plugin_id: None,
+                k3s_rke2: None,
             },
             "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => {
-                // K3s/RKE2 generate config.toml from a template on each restart; we modify
-                // the template so our changes persist. Which template is chosen by containerd version
-                // (see k3s_rke2_resolve_use_v3). Refs: docs.k3s.io/advanced#configuring-containerd
+                // K3s/RKE2: use versioned drop-in dir (config.toml.d / config-v3.toml.d).
+                // Import status is checked in setup_containerd_config_files. Refs:
+                // docs.k3s.io/advanced#configuring-containerd, github.com/k3s-io/k3s/pull/13680
                 let container_runtime_version = k8s::get_node_field(
                     self,
                     ".status.nodeInfo.containerRuntimeVersion",
@@ -529,16 +589,31 @@ impl Config {
                     &self.containerd_conf_file,
                     container_runtime_version.as_deref(),
                 )?;
-                let config_file =
-                    k3s_rke2_containerd_template_path(use_v3).to_string();
+                let config_file = k3s_rke2_containerd_template_path(use_v3).to_string();
                 let backup_file = format!("{config_file}.bak");
+                let template_dir = Path::new(&config_file)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "/etc/containerd".to_string());
+                let drop_in_file = format!(
+                    "{template_dir}/{}/kata-deploy.toml",
+                    k3s_rke2_drop_in_dir_name(use_v3)
+                );
+                // imports_file is always None for K3s/RKE2: we never use the standard
+                // "add drop-in path to imports array" mechanism here.
+                // marker_file is always set; setup creates it only when we prepend the import
+                // line, so cleanup can check its existence on disk to know whether to revert.
                 ContainerdPaths {
                     config_file: config_file.clone(),
                     backup_file,
-                    imports_file: Some(config_file),
-                    drop_in_file: self.containerd_drop_in_conf_file.clone(),
+                    imports_file: None,
+                    drop_in_file,
                     use_drop_in,
-                    plugin_id: Some(k3s_rke2_containerd_plugin_id(use_v3).to_string()),
+                    k3s_rke2: Some(K3sRke2Paths {
+                        plugin_id: k3s_rke2_containerd_plugin_id(use_v3).to_string(),
+                        use_v3,
+                        imports_marker_file: format!("{template_dir}/.kata-deploy-k3s-rke2-imports"),
+                    }),
                 }
             }
             _ => ContainerdPaths {
@@ -547,7 +622,7 @@ impl Config {
                 imports_file: Some(self.containerd_conf_file.clone()),
                 drop_in_file: self.containerd_drop_in_conf_file.clone(),
                 use_drop_in,
-                plugin_id: None,
+                k3s_rke2: None,
             },
         };
 
@@ -1165,5 +1240,60 @@ mod tests {
 
             cleanup_env_vars();
         }
+    }
+
+    // --- k3s_rke2_check_import_status ---
+    // These tests are pure (no env vars, no I/O) so they can run in parallel.
+
+    use rstest::rstest;
+
+    #[rstest]
+    // v2 cases
+    #[case(
+        "imports = [\"/var/lib/rancher/k3s/agent/etc/containerd/config.toml.d/*.toml\"]\n",
+        false,
+        "HasDefault",
+    )]
+    #[case(
+        "imports = [\"/some/other/path/*.toml\"]\n",
+        false,
+        "HasNonDefault",
+    )]
+    #[case("version = 2\n[plugins]\n", false, "NoImports")]
+    // v3 cases
+    #[case(
+        "imports = [\"/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/*.toml\"]\n",
+        true,
+        "HasDefault",
+    )]
+    #[case(
+        "imports = [\"/some/other/path/*.toml\"]\n",
+        true,
+        "HasNonDefault",
+    )]
+    #[case("version = 3\n[plugins]\n", true, "NoImports")]
+    // v2 default dir name must not match v3 default (and vice-versa)
+    #[case(
+        "imports = [\"/path/config.toml.d/*.toml\"]\n",
+        true,
+        "HasNonDefault",
+    )]
+    #[case(
+        "imports = [\"/path/config-v3.toml.d/*.toml\"]\n",
+        false,
+        "HasNonDefault",
+    )]
+    fn test_k3s_rke2_check_import_status(
+        #[case] content: &str,
+        #[case] use_v3: bool,
+        #[case] expected: &str,
+    ) {
+        let status = k3s_rke2_check_import_status(content, use_v3);
+        let got = match status {
+            K3sRke2ImportStatus::HasDefault => "HasDefault",
+            K3sRke2ImportStatus::HasNonDefault => "HasNonDefault",
+            K3sRke2ImportStatus::NoImports => "NoImports",
+        };
+        assert_eq!(got, expected, "content={content:?} use_v3={use_v3}");
     }
 }

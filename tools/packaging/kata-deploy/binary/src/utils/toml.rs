@@ -284,6 +284,10 @@ pub fn remove_from_toml_array(file_path: &Path, path: &str, value: &str) -> Resu
                     Value::String(s) => s.value() != normalized_value,
                     _ => true,
                 });
+                // If array is empty, remove the key so the file reverts cleanly (e.g. K3s template)
+                if arr.is_empty() {
+                    current.remove(part.as_str());
+                }
             } else {
                 return Err(anyhow::anyhow!("Path component '{part}' is not an array"));
             }

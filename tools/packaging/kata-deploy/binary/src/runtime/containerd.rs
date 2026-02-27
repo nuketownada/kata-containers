@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{Config, ContainerdPaths, CustomRuntime};
+use crate::config::{self, Config, ContainerdPaths, CustomRuntime, K3sRke2ImportStatus};
 use crate::k8s;
 use crate::utils;
 use crate::utils::toml as toml_utils;
@@ -171,8 +171,8 @@ pub async fn configure_containerd_runtime(
 
     let paths = config.get_containerd_paths(runtime).await?;
     let configuration_file = get_containerd_output_path(&paths);
-    let pluginid = match paths.plugin_id.as_deref() {
-        Some(plugin_id) => plugin_id,
+    let pluginid = match paths.k3s_rke2.as_ref() {
+        Some(k) => k.plugin_id.as_str(),
         None => get_containerd_pluginid(&paths.config_file)?,
     };
 
@@ -245,8 +245,8 @@ pub async fn configure_custom_containerd_runtime(
 
     let paths = config.get_containerd_paths(runtime).await?;
     let configuration_file = get_containerd_output_path(&paths);
-    let pluginid = match paths.plugin_id.as_deref() {
-        Some(plugin_id) => plugin_id,
+    let pluginid = match paths.k3s_rke2.as_ref() {
+        Some(k) => k.plugin_id.as_str(),
         None => get_containerd_pluginid(&paths.config_file)?,
     };
 
@@ -331,16 +331,14 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
             log::info!("Drop-in file already exists");
         }
 
-        // Add the drop-in file to the imports array in the main config
+        // Add the drop-in file to the imports array in the main config.
+        // For K3s/RKE2, imports_file is always None (imports are handled in setup_containerd_config_files).
         if let Some(imports_file) = &paths.imports_file {
             log::info!("Adding drop-in to imports in: {}", imports_file);
-            let imports_path = ".imports";
-            let drop_in_path = format!("\"{}\"", paths.drop_in_file);
-
             toml_utils::append_to_toml_array(
                 Path::new(imports_file),
-                imports_path,
-                &drop_in_path,
+                ".imports",
+                &format!("\"{}\"", paths.drop_in_file),
             )?;
             log::info!("Successfully added drop-in to imports array");
         } else {
@@ -388,13 +386,38 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
     let paths = config.get_containerd_paths(runtime).await?;
 
     if paths.use_drop_in {
-        // Remove drop-in from imports array (if imports are used)
-        if let Some(imports_file) = &paths.imports_file {
+        // K3s/RKE2: if we added the imports line ourselves, remove it from the template and the marker
+        if let Some(k) = &paths.k3s_rke2 {
+            let marker_file = &k.imports_marker_file;
+            if Path::new(marker_file).exists() {
+                let imports_line = config::k3s_rke2_imports_line_for_template(k.use_v3);
+                let content = fs::read_to_string(&paths.config_file)
+                    .with_context(|| format!("Failed to read template for cleanup: {}", paths.config_file))?;
+                // We prepended "imports_line\n", so remove that leading line
+                let rest = content
+                    .strip_prefix(imports_line.as_str())
+                    .map(|s| s.trim_start_matches(|c| c == '\n' || c == '\r'))
+                    .unwrap_or(content.as_str());
+                fs::write(&paths.config_file, rest)
+                    .with_context(|| format!("Failed to write template after cleanup: {}", paths.config_file))?;
+                fs::remove_file(marker_file)?;
+            }
+        } else if let Some(imports_file) = &paths.imports_file {
+            // Non-K3s/RKE2: remove our drop-in path from imports array
             toml_utils::remove_from_toml_array(
                 Path::new(imports_file),
                 ".imports",
                 &format!("\"{}\"", paths.drop_in_file),
             )?;
+        }
+        // Remove the drop-in file(s)
+        let drop_in_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
+            Path::new(&paths.drop_in_file).to_path_buf()
+        } else {
+            Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
+        };
+        if drop_in_path.exists() {
+            fs::remove_file(&drop_in_path)?;
         }
         return Ok(());
     }
@@ -411,23 +434,90 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
 }
 
 /// Setup containerd config files based on runtime type.
-/// For K3s/RKE2, resolves which template (v2 or v3) to use from the node's containerd version,
-/// then creates only that template file.
+///
+/// **Why K3s/RKE2 differ from microk8s/others:** K3s/RKE2 use a *template* that is rendered
+/// into a *generated* config.toml at runtime start. We may prepend an imports line to the
+/// template. Other distros (e.g. microk8s) use a single config or an imports file we edit
+/// directly; there is no "generated" file that can get out of sync. So only K3s/RKE2 have
+/// the failure mode: after cleanup we revert the template and remove the drop-in, but if we
+/// don't restart (e.g. to avoid killing the K3s API during preStop), the generated config
+/// on disk is stale. The next deploy must not rely on that file for the "prepend or not?"
+/// decision; it must use the template (and marker) so it works regardless of restart.
+///
+/// For K3s/RKE2 we inspect the **template** (and marker), not the generated config:
+///   1. Template already has default drop-in dir (k3s PR 13680) or marker exists → no change.
+///   2. Template has other imports → bail.
+///   3. No default imports → prepend to template and write marker.
 pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Result<()> {
     const K3S_RKE2_BASE_TMPL: &str = "{{ template \"base\" . }}\n";
 
     match runtime {
         "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server" => {
-            // K3s/RKE2: create only the chosen template (v2 or v3). See docs.k3s.io/advanced#configuring-containerd
             let paths = config.get_containerd_paths(runtime).await?;
-            let path = &paths.config_file;
-            if !Path::new(path).exists() {
-                if let Some(parent) = Path::new(path).parent() {
+            let k = paths.k3s_rke2.as_ref().expect("k3s/rke2 always has k3s_rke2");
+
+            // Ensure the template file exists (k3s/rke2 may not have created it yet)
+            let tmpl_path = &paths.config_file;
+            if !Path::new(tmpl_path).exists() {
+                if let Some(parent) = Path::new(tmpl_path).parent() {
                     fs::create_dir_all(parent)
                         .with_context(|| format!("Failed to create containerd config dir: {parent:?}"))?;
                 }
-                fs::write(path, K3S_RKE2_BASE_TMPL)
-                    .with_context(|| format!("Failed to write K3s/RKE2 template: {path}"))?;
+                fs::write(tmpl_path, K3S_RKE2_BASE_TMPL)
+                    .with_context(|| format!("Failed to write K3s/RKE2 template: {tmpl_path}"))?;
+            }
+
+            // Use the template (and marker) to decide whether to prepend — NOT the generated
+            // config.toml. After cleanup we revert the template and remove the marker; we may
+            // skip restart (e.g. preStop), so the generated file can be stale. Basing the
+            // decision on the template ensures the next deploy prepends when needed.
+            let marker_file = &k.imports_marker_file;
+            let tmpl_content = fs::read_to_string(tmpl_path)
+                .with_context(|| format!("Failed to read K3s/RKE2 template: {tmpl_path}"))?;
+
+            let status = if Path::new(marker_file).exists() {
+                // We (or a previous deploy) already prepended; no need to read template.
+                K3sRke2ImportStatus::HasDefault
+            } else {
+                config::k3s_rke2_check_import_status(&tmpl_content, k.use_v3)
+            };
+
+            match status {
+                K3sRke2ImportStatus::HasDefault => {
+                    log::info!(
+                        "K3s/RKE2: template already has default drop-in imports or marker present, \
+                         no template change needed"
+                    );
+                }
+                K3sRke2ImportStatus::HasNonDefault => {
+                    anyhow::bail!(
+                        "K3s/RKE2: template has imports pointing to a non-default location. \
+                         kata-deploy cannot safely add its drop-in here. \
+                         Please configure the default drop-in dir manually."
+                    );
+                }
+                K3sRke2ImportStatus::NoImports => {
+                    let imports_line = config::k3s_rke2_imports_line_for_template(k.use_v3);
+                    fs::write(tmpl_path, format!("{imports_line}\n{tmpl_content}"))
+                        .with_context(|| {
+                            format!("Failed to write K3s/RKE2 template: {tmpl_path}")
+                        })?;
+                    fs::write(marker_file, "").with_context(|| {
+                        format!("Failed to create K3s/RKE2 imports marker: {marker_file}")
+                    })?;
+                    log::info!(
+                        "K3s/RKE2: prepended import line to template and wrote marker at \
+                         {marker_file}"
+                    );
+                }
+            }
+
+            // Always create the versioned drop-in dir
+            if let Some(drop_in_parent) = Path::new(&paths.drop_in_file).parent() {
+                fs::create_dir_all(drop_in_parent)
+                    .with_context(|| {
+                        format!("Failed to create K3s/RKE2 drop-in dir: {drop_in_parent:?}")
+                    })?;
             }
         }
         "k0s-worker" | "k0s-controller" => {
