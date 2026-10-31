@@ -101,7 +101,26 @@ func bindMountContainerRootfs(ctx context.Context, shareDir, cid, cRootFs string
 
 	rootfsDest := filepath.Join(shareDir, cid, rootfsDir)
 
-	return bindMount(ctx, cRootFs, rootfsDest, readonly, "private")
+	absSource, rootfsDest, err := evalMountPath(cRootFs, rootfsDest)
+	if err != nil {
+		return err
+	}
+
+	// Use recursive bind mount to propagate sub-mounts (e.g., nix store
+	// bind mounts) into the shared directory for virtiofs guest access.
+	if err := syscall.Mount(absSource, rootfsDest, "bind", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("Could not bind mount %v to %v: %v", absSource, rootfsDest, err)
+	}
+
+	if err := syscall.Mount("none", rootfsDest, "", syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("Could not make mount point %v private: %v", rootfsDest, err)
+	}
+
+	if readonly {
+		return syscall.Mount(absSource, rootfsDest, "bind", uintptr(syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY), "")
+	}
+
+	return nil
 }
 
 func bindUnmountContainerShareDir(ctx context.Context, sharedDir, cID, target string) error {

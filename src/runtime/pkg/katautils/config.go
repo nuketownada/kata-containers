@@ -112,6 +112,7 @@ type hypervisor struct {
 	SnpIdAuth                      string                    `toml:"snp_id_auth"`
 	SnpGuestPolicy                 *uint64                   `toml:"snp_guest_policy"`
 	MeasurementAlgo                string                    `toml:"measurement_algo"`
+	TpmSocket                      string                    `toml:"tpm_socket"`
 	HypervisorPathList             []string                  `toml:"valid_hypervisor_paths"`
 	JailerPathList                 []string                  `toml:"valid_jailer_paths"`
 	VirtioFSDaemonList             []string                  `toml:"valid_virtio_fs_daemon_paths"`
@@ -1235,6 +1236,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		DisableSeLinux:                 h.DisableSeLinux,
 		DisableGuestSeLinux:            h.DisableGuestSeLinux,
 		NetRateLimiterBwMaxRate:        h.getNetRateLimiterBwMaxRate(),
+		TpmSocket:                      h.TpmSocket,
 		NetRateLimiterBwOneTimeBurst:   h.getNetRateLimiterBwOneTimeBurst(),
 		NetRateLimiterOpsMaxRate:       h.getNetRateLimiterOpsMaxRate(),
 		NetRateLimiterOpsOneTimeBurst:  h.getNetRateLimiterOpsOneTimeBurst(),
