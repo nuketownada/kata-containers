@@ -608,6 +608,44 @@ func addHypervisorConfigOverrides(ocispec specs.Spec, config *vc.SandboxConfig, 
 		}
 	}
 
+	if err := addSeedTpmOverrides(ocispec, config); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// addSeedTpmOverrides reads the seed.loom.farm/tpm-* annotations that make
+// the shim own the sandbox's swtpm (virtcontainers/swtpm.go).
+func addSeedTpmOverrides(ocispec specs.Spec, config *vc.SandboxConfig) error {
+	mode, ok := ocispec.Annotations[vcAnnotations.SeedTpmMode]
+	if !ok {
+		return nil
+	}
+	stateDir := ocispec.Annotations[vcAnnotations.SeedTpmStateDir]
+	fingerprint := ocispec.Annotations[vcAnnotations.SeedTpmFingerprint]
+
+	switch mode {
+	case vc.SeedTpmModeCreate, vc.SeedTpmModeVerify:
+	default:
+		return fmt.Errorf("annotation %s: invalid value %q (want %q or %q)",
+			vcAnnotations.SeedTpmMode, mode, vc.SeedTpmModeCreate, vc.SeedTpmModeVerify)
+	}
+	if stateDir == "" || !filepath.IsAbs(stateDir) {
+		return fmt.Errorf("annotation %s must be an absolute path, got %q", vcAnnotations.SeedTpmStateDir, stateDir)
+	}
+	if mode == vc.SeedTpmModeVerify && fingerprint == "" {
+		return fmt.Errorf("annotation %s is required when %s=%s",
+			vcAnnotations.SeedTpmFingerprint, vcAnnotations.SeedTpmMode, vc.SeedTpmModeVerify)
+	}
+	if config.HypervisorConfig.TpmSocket != "" {
+		return fmt.Errorf("annotations %s and %s are mutually exclusive",
+			vcAnnotations.SeedTpmMode, vcAnnotations.TpmSocket)
+	}
+
+	config.HypervisorConfig.SeedTpmMode = mode
+	config.HypervisorConfig.SeedTpmStateDir = stateDir
+	config.HypervisorConfig.SeedTpmFingerprint = fingerprint
 	return nil
 }
 

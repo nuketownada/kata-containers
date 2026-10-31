@@ -113,6 +113,10 @@ type hypervisor struct {
 	SnpGuestPolicy                 *uint64                   `toml:"snp_guest_policy"`
 	MeasurementAlgo                string                    `toml:"measurement_algo"`
 	TpmSocket                      string                    `toml:"tpm_socket"`
+	SwtpmPath                      string                    `toml:"swtpm_path"`
+	SwtpmSentinelPath              string                    `toml:"swtpm_sentinel_path"`
+	SwtpmExpectedFsid              string                    `toml:"swtpm_expected_fsid"`
+	SwtpmLockTimeout               uint32                    `toml:"swtpm_lock_timeout"`
 	HypervisorPathList             []string                  `toml:"valid_hypervisor_paths"`
 	JailerPathList                 []string                  `toml:"valid_jailer_paths"`
 	VirtioFSDaemonList             []string                  `toml:"valid_virtio_fs_daemon_paths"`
@@ -753,6 +757,20 @@ func (h hypervisor) getNetRateLimiterOpsOneTimeBurst() int64 {
 	return h.NetRateLimiterOpsOneTimeBurst
 }
 
+func (h hypervisor) swtpmSentinelPath() string {
+	if h.SwtpmSentinelPath == "" {
+		return vc.DefaultSwtpmSentinelPath
+	}
+	return h.SwtpmSentinelPath
+}
+
+func (h hypervisor) swtpmLockTimeout() uint32 {
+	if h.SwtpmLockTimeout == 0 {
+		return vc.DefaultSwtpmLockTimeout
+	}
+	return h.SwtpmLockTimeout
+}
+
 func (h hypervisor) getIOMMUPlatform() bool {
 	if h.IOMMUPlatform {
 		kataUtilsLogger.Info("IOMMUPlatform is enabled by default.")
@@ -1237,6 +1255,10 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		DisableGuestSeLinux:            h.DisableGuestSeLinux,
 		NetRateLimiterBwMaxRate:        h.getNetRateLimiterBwMaxRate(),
 		TpmSocket:                      h.TpmSocket,
+		SwtpmPath:                      h.SwtpmPath,
+		SwtpmSentinelPath:              h.swtpmSentinelPath(),
+		SwtpmExpectedFsid:              h.SwtpmExpectedFsid,
+		SwtpmLockTimeout:               h.swtpmLockTimeout(),
 		NetRateLimiterBwOneTimeBurst:   h.getNetRateLimiterBwOneTimeBurst(),
 		NetRateLimiterOpsMaxRate:       h.getNetRateLimiterOpsMaxRate(),
 		NetRateLimiterOpsOneTimeBurst:  h.getNetRateLimiterOpsOneTimeBurst(),

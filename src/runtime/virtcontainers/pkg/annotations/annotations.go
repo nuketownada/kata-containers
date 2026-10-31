@@ -182,6 +182,13 @@ const (
 	// TpmSocket is a sandbox annotation to specify the swtpm socket path for vTPM device
 	TpmSocket = kataAnnotHypervisorPrefix + "tpm_socket"
 
+	// Seed shim-owned swtpm. These are not io.katacontainers.* keys, so they
+	// are not subject to enable_annotations; containerd must pass them
+	// through (pod_annotations).
+	SeedTpmMode        = "seed.loom.farm/tpm-mode"
+	SeedTpmStateDir    = "seed.loom.farm/tpm-state-dir"
+	SeedTpmFingerprint = "seed.loom.farm/tpm-fingerprint"
+
 	// Enable Hypervisor Devices IOMMU_PLATFORM
 	IOMMUPlatform = kataAnnotHypervisorPrefix + "enable_iommu_platform"
 

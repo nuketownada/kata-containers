@@ -22,6 +22,23 @@ image = "@IMAGEPATH@"
 #   - erofs
 rootfs_type = @DEFROOTFSTYPE@
 
+# Seed shim-owned swtpm. Used only for sandboxes annotated with
+# seed.loom.farm/tpm-mode (create|verify), seed.loom.farm/tpm-state-dir and,
+# for verify, seed.loom.farm/tpm-fingerprint. The shim then checks the
+# sentinel, takes an exclusive flock on <state-dir>/.session-lock, runs one
+# swtpm (seed:// backend) for the sandbox and checks the TPM fingerprint
+# before cloud-hypervisor starts.
+#
+# swtpm binary (must support the seed:// backend). Required for tpm-mode.
+#swtpm_path = ""
+# File whose trimmed content must equal swtpm_expected_fsid; the state dir
+# must be below its directory and on the same filesystem.
+#swtpm_sentinel_path = "/var/lib/seed-controller/tpm/.seed-fs"
+# Ceph fsid of the shared TPM state filesystem. Required for tpm-mode.
+#swtpm_expected_fsid = ""
+# Seconds to wait for the session lock.
+#swtpm_lock_timeout = 120
+
 # Enable running clh VMM as a non-root user.
 # By default clh VMM run as root. When this is set to true, clh VMM process runs as
 # a non-root random user. See documentation for the limitations of this mode.

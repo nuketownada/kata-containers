@@ -560,6 +560,17 @@ type HypervisorConfig struct {
 	// TpmSocket is the path to the swtpm socket for vTPM device passthrough via CLH
 	TpmSocket string
 
+	// Seed shim-owned swtpm (see swtpm.go). The Swtpm* fields come from the
+	// Kata configuration file, the SeedTpm* fields from the sandbox's
+	// seed.loom.farm/tpm-* annotations. SeedTpmMode == "" disables it.
+	SwtpmPath          string
+	SwtpmSentinelPath  string
+	SwtpmExpectedFsid  string
+	SwtpmLockTimeout   uint32
+	SeedTpmMode        string
+	SeedTpmStateDir    string
+	SeedTpmFingerprint string
+
 	// VMid is the id of the VM that create the hypervisor if the VM is created by the factory.
 	// VMid is "" if the hypervisor is not created by the factory.
 	VMid string

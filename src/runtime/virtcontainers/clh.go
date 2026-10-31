@@ -266,6 +266,7 @@ func (s *CloudHypervisorState) reset() {
 type cloudHypervisor struct {
 	console         console.Console
 	virtiofsDaemon  VirtiofsDaemon
+	swtpm           *swtpm
 	APIClient       clhClient
 	ctx             context.Context
 	id              string
@@ -609,7 +610,19 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	clh.vmconfig.Rng.SetIommu(clh.config.IOMMU)
 
 	// vTPM: pass swtpm socket to CLH for TPM 2.0 CRB device in guest
-	if clh.config.TpmSocket != "" {
+	if clh.config.SeedTpmMode != "" {
+		// Seed: the shim owns this sandbox's swtpm (swtpm.go). It is
+		// started in StartVM, before cloud-hypervisor.
+		if clh.config.TpmSocket != "" {
+			return errors.New("seed tpm-mode and tpm_socket are mutually exclusive")
+		}
+		cfg := newSwtpmConfig(&clh.config, filepath.Join(clh.config.VMStorePath, id))
+		if err := cfg.validate(); err != nil {
+			return err
+		}
+		clh.swtpm = newSwtpm(cfg)
+		clh.vmconfig.Tpm = chclient.NewTpmConfig(cfg.socketPath)
+	} else if clh.config.TpmSocket != "" {
 		clh.vmconfig.Tpm = chclient.NewTpmConfig(clh.config.TpmSocket)
 	}
 
@@ -748,6 +761,21 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 		defer selinux.SetExecLabel("")
 	}
 
+	// Seed: sentinel, session lock, swtpm, fingerprint check -- all before
+	// cloud-hypervisor exists. Any failure fails sandbox creation.
+	if clh.swtpm != nil {
+		if err = clh.swtpm.Start(ctx); err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				if stopErr := clh.swtpm.Stop(ctx); stopErr != nil {
+					clh.Logger().WithError(stopErr).Warn("error stopping swtpm")
+				}
+			}
+		}()
+	}
+
 	err = clh.setupVirtiofsDaemon(ctx)
 	if err != nil {
 		return err
@@ -776,8 +804,16 @@ func (clh *cloudHypervisor) StartVM(ctx context.Context, timeout int) error {
 	ctx, cancel := context.WithTimeout(ctx, bootTimeout*time.Second)
 	defer cancel()
 
-	if err := clh.bootVM(ctx); err != nil {
+	if err = clh.bootVM(ctx); err != nil {
 		return err
+	}
+
+	if clh.swtpm != nil {
+		// From now on a dying swtpm tears the sandbox down, like virtiofsd:
+		// cloud-hypervisor never reconnects to a restarted swtpm.
+		clh.swtpm.arm(func() {
+			clh.StopVM(context.Background(), false)
+		})
 	}
 
 	clh.state.state = clhReady
@@ -1431,6 +1467,19 @@ func (clh *cloudHypervisor) terminate(ctx context.Context, waitOnly bool) (err e
 		clh.Logger().Debug("Cleanup VM")
 		if err1 := clh.cleanupVM(true); err1 != nil {
 			clh.Logger().WithError(err1).Error("failed to cleanupVM")
+		}
+	}()
+
+	// Runs before cleanupVM (defers are LIFO) and on every return path:
+	// swtpm must not outlive the sandbox, and the TPM session lock is only
+	// released once swtpm has exited.
+	defer func() {
+		if clh.swtpm == nil {
+			return
+		}
+		clh.Logger().Debug("stop swtpm")
+		if err1 := clh.swtpm.Stop(ctx); err1 != nil {
+			clh.Logger().WithError(err1).Error("failed to stop swtpm")
 		}
 	}()
 
